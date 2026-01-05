@@ -1,0 +1,937 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import OpenAI from "openai";
+import { storage } from "./storage";
+import {
+  setupAuth,
+  registerAuthRoutes,
+  isAuthenticated,
+} from "./replit_integrations/auth";
+import { registerChatRoutes } from "./replit_integrations/chat";
+import { registerImageRoutes } from "./replit_integrations/image";
+import {
+  insertCategorySchema,
+  insertTransactionSchema,
+  insertRolloverSchema,
+  insertFinancialInsightSchema,
+  insertOtherIncomeSchema,
+  type InsertCategory,
+} from "@shared/schema";
+import { z } from "zod";
+
+// Icon and color mapping for category parents
+const CATEGORY_ICON_MAP: Record<string, { icon: string; color: string }> = {
+  "הוצאות משרד": { icon: "Building2", color: "#6366F1" },
+  תקשורת: { icon: "Phone", color: "#3B82F6" },
+  "הפרשות קבועות": { icon: "PiggyBank", color: "#8B5CF6" },
+  תחבורה: { icon: "Car", color: "#F59E0B" },
+  תוכנות: { icon: "Laptop", color: "#14B8A6" },
+  "ספקים בריטיינר": { icon: "Users", color: "#EC4899" },
+  "רשויות מס": { icon: "Receipt", color: "#EF4444" },
+  מזון: { icon: "UtensilsCrossed", color: "#22C55E" },
+  בילויים: { icon: "PartyPopper", color: "#A855F7" },
+  קניות: { icon: "ShoppingBag", color: "#F97316" },
+  בריאות: { icon: "Heart", color: "#EF4444" },
+  חינוך: { icon: "GraduationCap", color: "#3B82F6" },
+  דיור: { icon: "Home", color: "#6366F1" },
+  חשבונות: { icon: "FileText", color: "#64748B" },
+  ביטוח: { icon: "Shield", color: "#8B5CF6" },
+  חיסכון: { icon: "Landmark", color: "#14B8A6" },
+};
+
+const DEFAULT_ICON = { icon: "Wallet", color: "#8B5CF6" };
+
+interface ParsedCategory {
+  name: string;
+  type:
+    | "business_fixed"
+    | "business_variable"
+    | "household_fixed"
+    | "household_variable";
+  parentGroup: string;
+  icon: string;
+  color: string;
+}
+
+function parseExcelCategories(rawText: string): ParsedCategory[] {
+  const lines = rawText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const categories: ParsedCategory[] = [];
+
+  let currentSection:
+    | "income"
+    | "business_fixed"
+    | "business_variable"
+    | "household_fixed"
+    | "household_variable"
+    | null = null;
+  let currentParent = "";
+
+  // Regex patterns for more flexible section detection
+  const incomePattern = /הכנסות\s*[::]?/i;
+  const businessFixedPattern =
+    /הוצאות\s*(קבועות|משתנות)?\s*(ב?עסק|עסקיות)\s*(קבועות)?\s*[::]?/i;
+  const businessVariablePattern = /הוצאות\s*משתנות\s*(ב?עסק|עסקיות)\s*[::]?/i;
+  const householdFixedPattern =
+    /הוצאות\s*(קבועות)?\s*(ב?משק\s*בית|ביתיות|הבית)\s*(קבועות)?\s*[::]?/i;
+  const householdVariablePattern =
+    /הוצאות\s*משתנות\s*(ב?משק\s*בית|ביתיות|הבית)\s*[::]?/i;
+
+  for (const line of lines) {
+    // Detect main sections using regex patterns
+    if (incomePattern.test(line) && !line.includes("הוצאות")) {
+      currentSection = "income";
+      continue;
+    }
+    // Check variable patterns first (more specific)
+    if (businessVariablePattern.test(line)) {
+      currentSection = "business_variable";
+      continue;
+    }
+    if (householdVariablePattern.test(line)) {
+      currentSection = "household_variable";
+      continue;
+    }
+    // Check fixed patterns
+    if (businessFixedPattern.test(line) && line.includes("קבועות")) {
+      currentSection = "business_fixed";
+      continue;
+    }
+    if (householdFixedPattern.test(line) && line.includes("קבועות")) {
+      currentSection = "household_fixed";
+      continue;
+    }
+    // Generic business expense (default to fixed if just "בעסק")
+    if (
+      /הוצאות\s*(קבועות)?\s*(ב?עסק|עסקיות)\s*[::]?/i.test(line) &&
+      !businessVariablePattern.test(line)
+    ) {
+      currentSection = "business_fixed";
+      continue;
+    }
+    // Generic household expense (default to fixed if just "בבית")
+    if (
+      /הוצאות\s*(קבועות)?\s*(ב?משק\s*בית|ביתיות|הבית)\s*[::]?/i.test(line) &&
+      !householdVariablePattern.test(line)
+    ) {
+      currentSection = "household_fixed";
+      continue;
+    }
+
+    // Skip income items (income is tracked as transactions, not categories)
+    if (currentSection === "income") {
+      continue;
+    }
+
+    // Skip if no valid section
+    if (!currentSection) {
+      continue;
+    }
+
+    // Detect numbered parent groups like "1.הוצאות משרד :" or "2.תקשורת:"
+    const parentMatch = line.match(/^\d+\s*[.)]?\s*([^:]+)\s*:?\s*$/);
+    if (parentMatch) {
+      currentParent = parentMatch[1].trim();
+      continue;
+    }
+
+    // Skip empty or header-like lines
+    if (line.match(/^[\d.:\s]+$/) || line.length < 2) {
+      continue;
+    }
+
+    // This is a category item
+    const cleanName = line.replace(/^\d+[.)]?\s*/, "").trim();
+    if (cleanName.length < 2) continue;
+
+    // Get icon/color from parent group or default
+    const iconConfig = CATEGORY_ICON_MAP[currentParent] || DEFAULT_ICON;
+
+    // Create flat category with parent prefix for clarity
+    const fullName = currentParent
+      ? `${currentParent} - ${cleanName}`
+      : cleanName;
+
+    categories.push({
+      name: fullName,
+      type: currentSection,
+      parentGroup: currentParent,
+      icon: iconConfig.icon,
+      color: iconConfig.color,
+    });
+  }
+
+  return categories;
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+});
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express,
+): Promise<Server> {
+  // Setup Replit Auth (BEFORE other routes)
+  await setupAuth(app);
+  registerAuthRoutes(app);
+
+  // Categories API
+  app.get("/api/categories", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const type = req.query.type as string | undefined;
+      if (type) {
+        const categories = await storage.getCategoriesByType(userId, type);
+        return res.json(categories);
+      }
+      const categories = await storage.getCategories(userId);
+      res.json(categories);
+    } catch (error) {
+      console.error("Error fetching categories:", error);
+      res.status(500).json({ message: "Failed to fetch categories" });
+    }
+  });
+
+  app.get("/api/categories/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const category = await storage.getCategory(req.params.id, userId);
+      if (!category) {
+        return res.status(404).json({ message: "Category not found" });
+      }
+      res.json(category);
+    } catch (error) {
+      console.error("Error fetching category:", error);
+      res.status(500).json({ message: "Failed to fetch category" });
+    }
+  });
+
+  app.post("/api/categories", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertCategorySchema.parse({ ...req.body, userId });
+      const category = await storage.createCategory(validatedData);
+      res.status(201).json(category);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res
+          .status(400)
+          .json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error("Error creating category:", error);
+      res.status(500).json({ message: "Failed to create category" });
+    }
+  });
+
+  app.patch("/api/categories/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const category = await storage.updateCategory(
+        req.params.id,
+        userId,
+        req.body,
+      );
+      if (!category) {
+        return res.status(404).json({ message: "Category not found" });
+      }
+      res.json(category);
+    } catch (error) {
+      console.error("Error updating category:", error);
+      res.status(500).json({ message: "Failed to update category" });
+    }
+  });
+
+  app.delete("/api/categories/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      await storage.deleteCategory(req.params.id, userId);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting category:", error);
+      res.status(500).json({ message: "Failed to delete category" });
+    }
+  });
+
+  // Transactions API
+  app.get("/api/transactions", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { month, year, categoryId, limit } = req.query;
+
+      if (month && year && categoryId) {
+        const transactions = await storage.getTransactionsByCategory(
+          userId,
+          categoryId as string,
+          parseInt(month as string),
+          parseInt(year as string),
+        );
+        return res.json(transactions);
+      }
+
+      if (month && year) {
+        const transactions = await storage.getTransactionsByMonth(
+          userId,
+          parseInt(month as string),
+          parseInt(year as string),
+        );
+        return res.json(transactions);
+      }
+
+      const limitNum = limit ? parseInt(limit as string) : 50;
+      const transactions = await storage.getTransactions(userId, limitNum);
+      res.json(transactions);
+    } catch (error) {
+      console.error("Error fetching transactions:", error);
+      res.status(500).json({ message: "Failed to fetch transactions" });
+    }
+  });
+
+  app.get("/api/transactions/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const transaction = await storage.getTransaction(req.params.id, userId);
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      res.json(transaction);
+    } catch (error) {
+      console.error("Error fetching transaction:", error);
+      res.status(500).json({ message: "Failed to fetch transaction" });
+    }
+  });
+
+  app.post("/api/transactions", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertTransactionSchema.parse({
+        ...req.body,
+        userId,
+      });
+      const transaction = await storage.createTransaction(validatedData);
+      res.status(201).json(transaction);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res
+          .status(400)
+          .json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error("Error creating transaction:", error);
+      res.status(500).json({ message: "Failed to create transaction" });
+    }
+  });
+
+  app.patch("/api/transactions/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const transaction = await storage.updateTransaction(
+        req.params.id,
+        userId,
+        req.body,
+      );
+      if (!transaction) {
+        return res.status(404).json({ message: "Transaction not found" });
+      }
+      res.json(transaction);
+    } catch (error) {
+      console.error("Error updating transaction:", error);
+      res.status(500).json({ message: "Failed to update transaction" });
+    }
+  });
+
+  app.delete(
+    "/api/transactions/:id",
+    isAuthenticated,
+    async (req: any, res) => {
+      try {
+        const userId = req.user.claims.sub;
+        await storage.deleteTransaction(req.params.id, userId);
+        res.status(204).send();
+      } catch (error) {
+        console.error("Error deleting transaction:", error);
+        res.status(500).json({ message: "Failed to delete transaction" });
+      }
+    },
+  );
+
+  // Rollovers API
+  app.get("/api/rollovers", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { month, year } = req.query;
+
+      if (month && year) {
+        const rollovers = await storage.getRolloversByMonth(
+          userId,
+          parseInt(month as string),
+          parseInt(year as string),
+        );
+        return res.json(rollovers);
+      }
+
+      const rollovers = await storage.getRollovers(userId);
+      res.json(rollovers);
+    } catch (error) {
+      console.error("Error fetching rollovers:", error);
+      res.status(500).json({ message: "Failed to fetch rollovers" });
+    }
+  });
+
+  app.post("/api/rollovers", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertRolloverSchema.parse({ ...req.body, userId });
+      const rollover = await storage.upsertRollover(validatedData);
+      res.status(201).json(rollover);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res
+          .status(400)
+          .json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error("Error creating rollover:", error);
+      res.status(500).json({ message: "Failed to create rollover" });
+    }
+  });
+
+  app.patch("/api/rollovers/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const rollover = await storage.updateRollover(
+        req.params.id,
+        userId,
+        req.body,
+      );
+      if (!rollover) {
+        return res.status(404).json({ message: "Rollover not found" });
+      }
+      res.json(rollover);
+    } catch (error) {
+      console.error("Error updating rollover:", error);
+      res.status(500).json({ message: "Failed to update rollover" });
+    }
+  });
+
+  // Financial Insights API
+  app.get("/api/insights", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const unreadOnly = req.query.unread === "true";
+
+      if (unreadOnly) {
+        const insights = await storage.getUnreadInsights(userId);
+        return res.json(insights);
+      }
+
+      const insights = await storage.getFinancialInsights(userId);
+      res.json(insights);
+    } catch (error) {
+      console.error("Error fetching insights:", error);
+      res.status(500).json({ message: "Failed to fetch insights" });
+    }
+  });
+
+  app.post("/api/insights", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertFinancialInsightSchema.parse({
+        ...req.body,
+        userId,
+      });
+      const insight = await storage.createFinancialInsight(validatedData);
+      res.status(201).json(insight);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res
+          .status(400)
+          .json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error("Error creating insight:", error);
+      res.status(500).json({ message: "Failed to create insight" });
+    }
+  });
+
+  app.patch(
+    "/api/insights/:id/read",
+    isAuthenticated,
+    async (req: any, res) => {
+      try {
+        const userId = req.user.claims.sub;
+        const insight = await storage.markInsightAsRead(req.params.id, userId);
+        if (!insight) {
+          return res.status(404).json({ message: "Insight not found" });
+        }
+        res.json(insight);
+      } catch (error) {
+        console.error("Error marking insight as read:", error);
+        res.status(500).json({ message: "Failed to update insight" });
+      }
+    },
+  );
+
+  // Other Income API
+  app.get("/api/other-income", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { month, year } = req.query;
+
+      if (month && year) {
+        const income = await storage.getOtherIncomeByMonth(
+          userId,
+          parseInt(month as string),
+          parseInt(year as string),
+        );
+        return res.json(income);
+      }
+
+      const income = await storage.getOtherIncome(userId);
+      res.json(income);
+    } catch (error) {
+      console.error("Error fetching other income:", error);
+      res.status(500).json({ message: "Failed to fetch other income" });
+    }
+  });
+
+  app.post("/api/other-income", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const validatedData = insertOtherIncomeSchema.parse({
+        ...req.body,
+        userId,
+      });
+      const income = await storage.createOtherIncome(validatedData);
+      res.status(201).json(income);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res
+          .status(400)
+          .json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error("Error creating other income:", error);
+      res.status(500).json({ message: "Failed to create other income" });
+    }
+  });
+
+  app.patch("/api/other-income/:id", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const income = await storage.updateOtherIncome(
+        req.params.id,
+        userId,
+        req.body,
+      );
+      if (!income) {
+        return res.status(404).json({ message: "Income not found" });
+      }
+      res.json(income);
+    } catch (error) {
+      console.error("Error updating other income:", error);
+      res.status(500).json({ message: "Failed to update other income" });
+    }
+  });
+
+  app.delete(
+    "/api/other-income/:id",
+    isAuthenticated,
+    async (req: any, res) => {
+      try {
+        const userId = req.user.claims.sub;
+        await storage.deleteOtherIncome(req.params.id, userId);
+        res.status(204).send();
+      } catch (error) {
+        console.error("Error deleting other income:", error);
+        res.status(500).json({ message: "Failed to delete other income" });
+      }
+    },
+  );
+
+  // Cash Flow Projection API
+  app.get("/api/cashflow", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { month, year } = req.query;
+
+      if (!month || !year) {
+        return res.status(400).json({ message: "Month and year are required" });
+      }
+
+      const transactions = await storage.getTransactionsByMonth(
+        userId,
+        parseInt(month as string),
+        parseInt(year as string),
+      );
+
+      // Group transactions by charge date for credit card transactions
+      const cashFlowByDay: Record<
+        number,
+        { credits: number; debits: number; transactions: typeof transactions }
+      > = {};
+
+      for (let day = 1; day <= 31; day++) {
+        cashFlowByDay[day] = { credits: 0, debits: 0, transactions: [] };
+      }
+
+      transactions.forEach((tx) => {
+        const effectiveDay =
+          tx.paymentMethod === "credit" && tx.chargeDate
+            ? tx.chargeDate
+            : new Date(tx.date).getDate();
+
+        if (cashFlowByDay[effectiveDay]) {
+          if (tx.transactionType === "income") {
+            cashFlowByDay[effectiveDay].credits += tx.amount;
+          } else {
+            cashFlowByDay[effectiveDay].debits += tx.amount;
+          }
+          cashFlowByDay[effectiveDay].transactions.push(tx);
+        }
+      });
+
+      res.json(cashFlowByDay);
+    } catch (error) {
+      console.error("Error generating cash flow:", error);
+      res.status(500).json({ message: "Failed to generate cash flow" });
+    }
+  });
+
+  // AI Chat Transaction Parsing API
+  app.post(
+    "/api/ai/parse-transaction",
+    isAuthenticated,
+    async (req: any, res) => {
+      try {
+        const userId = req.user.claims.sub;
+        const { message } = req.body;
+
+        if (!message) {
+          return res.status(400).json({ message: "Message is required" });
+        }
+
+        // Get user's categories for context
+        const userCategories = await storage.getCategories(userId);
+        const categoryNames = userCategories
+          .map((c) => `${c.name} (${c.type})`)
+          .join(", ");
+
+        const response = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: `אתה עוזר פיננסי שמנתח הודעות בעברית לזיהוי עסקאות. 
+נתח את ההודעה וחלץ:
+- amount: הסכום (מספר)
+- category: הקטגוריה המתאימה ביותר מהרשימה: ${categoryNames || "מסעדות, מכולת, תחבורה, בילויים, קניות"}
+- type: expense או income
+- description: תיאור קצר
+
+החזר JSON בלבד בפורמט:
+{"amount": number, "category": string, "type": "expense"|"income", "description": string, "confidence": number}
+
+אם לא מצאת עסקה, החזר: {"error": "לא זוהתה עסקה"}`,
+            },
+            {
+              role: "user",
+              content: message,
+            },
+          ],
+          max_completion_tokens: 200,
+          response_format: { type: "json_object" },
+        });
+
+        const parsed = JSON.parse(
+          response.choices[0]?.message?.content || "{}",
+        );
+
+        if (parsed.error) {
+          return res.json({ success: false, error: parsed.error });
+        }
+
+        // Find matching category
+        const matchedCategory = userCategories.find(
+          (c) =>
+            c.name
+              .toLowerCase()
+              .includes(parsed.category?.toLowerCase() || "") ||
+            (parsed.category?.toLowerCase() || "").includes(
+              c.name.toLowerCase(),
+            ),
+        );
+
+        // Create the transaction
+        const now = new Date();
+        const transaction = await storage.createTransaction({
+          userId,
+          amount: parsed.amount,
+          description: parsed.description,
+          categoryId: matchedCategory?.id,
+          transactionType: parsed.type === "income" ? "income" : "expense",
+          date: now,
+          month: now.getMonth() + 1,
+          year: now.getFullYear(),
+          paymentMethod: "cash",
+        });
+
+        res.json({
+          success: true,
+          transaction,
+          parsed,
+          message: `נרשמה עסקה: ${parsed.amount} ש״ח ל${parsed.category || parsed.description}`,
+        });
+      } catch (error) {
+        console.error("Error parsing transaction:", error);
+        res.status(500).json({ message: "Failed to parse transaction" });
+      }
+    },
+  );
+
+  // Bulk Seed Categories from Excel Data
+  app.post("/api/seed/categories", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { rawData, dryRun = false } = req.body;
+
+      if (!rawData || typeof rawData !== "string") {
+        return res
+          .status(400)
+          .json({ message: "rawData is required and must be a string" });
+      }
+
+      // Parse the Excel data
+      const parsed = parseExcelCategories(rawData);
+
+      if (parsed.length === 0) {
+        return res.status(400).json({
+          message: "No valid categories found in the data",
+          hint: "Make sure the data includes section headers like 'הוצאות קבועות בעסק:'",
+        });
+      }
+
+      // Get existing categories for deduplication
+      const existingCategories = await storage.getCategories(userId);
+      const existingNames = new Set(
+        existingCategories.map((c) => c.name.toLowerCase().trim()),
+      );
+
+      const toCreate: InsertCategory[] = [];
+      const skipped: string[] = [];
+
+      for (const cat of parsed) {
+        const normalizedName = cat.name.toLowerCase().trim();
+        if (existingNames.has(normalizedName)) {
+          skipped.push(cat.name);
+        } else {
+          toCreate.push({
+            userId,
+            name: cat.name,
+            type: cat.type,
+            monthlyBudget: 0,
+            importanceScore: 5,
+            isPaid: false,
+            icon: cat.icon,
+            color: cat.color,
+          });
+          existingNames.add(normalizedName); // Prevent duplicates within this batch
+        }
+      }
+
+      // If dry run, just return what would be created
+      if (dryRun) {
+        return res.json({
+          dryRun: true,
+          parsed: parsed.length,
+          toCreate: toCreate.length,
+          skipped: skipped.length,
+          categories: toCreate.map((c) => ({
+            name: c.name,
+            type: c.type,
+            icon: c.icon,
+            color: c.color,
+          })),
+          skippedNames: skipped,
+        });
+      }
+
+      // Actually create the categories
+      const created: any[] = [];
+      for (const cat of toCreate) {
+        const newCat = await storage.createCategory(cat);
+        created.push(newCat);
+      }
+
+      res.json({
+        success: true,
+        created: created.length,
+        skipped: skipped.length,
+        categories: created,
+        skippedNames: skipped,
+        message: `נוצרו ${created.length} קטגוריות חדשות${skipped.length > 0 ? `, דילגנו על ${skipped.length} כפולות` : ""}`,
+      });
+    } catch (error) {
+      console.error("Error seeding categories:", error);
+      res.status(500).json({ message: "Failed to seed categories" });
+    }
+  });
+
+  // Category Analysis API - returns spending history and AI insight
+  app.get(
+    "/api/categories/:id/analysis",
+    isAuthenticated,
+    async (req: any, res) => {
+      try {
+        const userId = req.user.claims.sub;
+        const categoryId = req.params.id;
+        const aiModel = (req.query.model as string) || "openai";
+
+        // Get category
+        const category = await storage.getCategory(categoryId, userId);
+        if (!category) {
+          return res.status(404).json({ message: "Category not found" });
+        }
+
+        // Get last 6 months of transactions for this category
+        const now = new Date();
+        const months: { month: number; year: number; total: number }[] = [];
+
+        for (let i = 5; i >= 0; i--) {
+          const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
+          const month = date.getMonth() + 1;
+          const year = date.getFullYear();
+
+          const transactions = await storage.getTransactionsByCategory(
+            userId,
+            categoryId,
+            month,
+            year,
+          );
+          const total = transactions.reduce((sum, t) => sum + t.amount, 0);
+
+          months.push({ month, year, total });
+        }
+
+        // Calculate trend data
+        const totalSpent = months.reduce((sum, m) => sum + m.total, 0);
+        const avgMonthly = totalSpent / 6;
+        const lastMonth = months[months.length - 1].total;
+        const prevMonth = months[months.length - 2].total;
+        const trend =
+          prevMonth > 0 ? ((lastMonth - prevMonth) / prevMonth) * 100 : 0;
+
+        // Generate AI insight
+        let insight = "";
+        try {
+          const prompt = `אתה יועץ פיננסי חד. נתח את מגמת ההוצאות עבור קטגוריית "${category.name}".
+נתונים ל-6 חודשים אחרונים: ${months.map((m) => `${m.month}/${m.year}: ${m.total} ש״ח`).join(", ")}.
+תקציב חודשי: ${category.monthlyBudget} ש״ח.
+ממוצע חודשי: ${avgMonthly.toFixed(0)} ש״ח.
+שינוי מהחודש הקודם: ${trend.toFixed(1)}%.
+
+ענה בעברית בקיצור (2-3 משפטים). תן טיפ אחד מעשי לחיסכון או שיפור.`;
+
+          const response = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+              {
+                role: "system",
+                content: "אתה יועץ פיננסי חכם וענייני. ענה תמיד בעברית.",
+              },
+              { role: "user", content: prompt },
+            ],
+            max_completion_tokens: 200,
+          });
+
+          insight = response.choices[0]?.message?.content || "";
+        } catch (aiError) {
+          console.error("AI insight error:", aiError);
+          insight = "לא ניתן ליצור ניתוח כרגע. נסה שוב מאוחר יותר.";
+        }
+
+        res.json({
+          category,
+          months,
+          summary: {
+            totalSpent,
+            avgMonthly,
+            lastMonth,
+            trend,
+            budget: category.monthlyBudget,
+          },
+          insight,
+          model: aiModel === "gemini" ? "Gemini" : "ChatGPT",
+        });
+      } catch (error) {
+        console.error("Error fetching category analysis:", error);
+        res.status(500).json({ message: "Failed to fetch analysis" });
+      }
+    },
+  );
+
+  // AI Chat General API
+  app.post("/api/ai/chat", isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const { message } = req.body;
+
+      if (!message) {
+        return res.status(400).json({ message: "Message is required" });
+      }
+
+      // Get user's financial context
+      const now = new Date();
+      const month = now.getMonth() + 1;
+      const year = now.getFullYear();
+
+      const [categories, transactions, insights] = await Promise.all([
+        storage.getCategories(userId),
+        storage.getTransactionsByMonth(userId, month, year),
+        storage.getUnreadInsights(userId),
+      ]);
+
+      const totalExpenses = transactions
+        .filter((t) => t.transactionType === "expense")
+        .reduce((sum, t) => sum + t.amount, 0);
+      const totalIncome = transactions
+        .filter((t) => t.transactionType === "income")
+        .reduce((sum, t) => sum + t.amount, 0);
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: `אתה יועץ פיננסי אישי בעברית. הנה הקשר המשתמש לחודש ${month}/${year}:
+- סה״כ הכנסות: ${totalIncome} ש״ח
+- סה״כ הוצאות: ${totalExpenses} ש״ח
+- מספר קטגוריות: ${categories.length}
+- התראות לא נקראו: ${insights.length}
+
+עזור למשתמש עם שאלות על התקציב שלו. היה קצר וענייני.`,
+          },
+          {
+            role: "user",
+            content: message,
+          },
+        ],
+        max_completion_tokens: 500,
+      });
+
+      res.json({
+        response:
+          response.choices[0]?.message?.content ||
+          "אני לא מצליח לענות כרגע. נסה שוב.",
+      });
+    } catch (error) {
+      console.error("Error in AI chat:", error);
+      res.status(500).json({ message: "Failed to process chat" });
+    }
+  });
+
+  // Register chat and image routes
+  registerChatRoutes(app);
+  registerImageRoutes(app);
+
+  return httpServer;
+}
